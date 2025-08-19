@@ -15,10 +15,159 @@ import SwiftUI
     typealias PlatformImage = NSImage
 #endif
 
-let videoSystemPrompt =
-    "Focus only on describing the key dramatic action or notable event occurring in this video segment. Skip general context or scene-setting details unless they are crucial to understanding the main action."
-let imageSystemPrompt =
-    "You are an image understanding model capable of describing the salient features of any image."
+#if os(iOS) || os(visionOS)
+import AVFoundation
+
+final class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleBufferDelegate {
+
+    @Published var latestCIImage: CIImage?
+    let session = AVCaptureSession()
+
+    private let sessionQueue = DispatchQueue(label: "camera.session.queue")
+    private let output = AVCaptureVideoDataOutput()
+    private var currentInput: AVCaptureDeviceInput?
+
+    func start(frontCamera: Bool) {
+        Task {
+            let authorized = await Self.requestAuthorization()
+            guard authorized else { return }
+            self.sessionQueue.async { [weak self] in
+                guard let self = self else { return }
+                self.configureSession(frontCamera: frontCamera)
+                if !self.session.isRunning {
+                    self.session.startRunning()
+                }
+            }
+        }
+    }
+
+    func stop() {
+        sessionQueue.async { [weak self] in
+            guard let self = self else { return }
+            if self.session.isRunning {
+                self.session.stopRunning()
+            }
+            self.latestCIImage = nil
+        }
+    }
+
+    func switchCamera(frontCamera: Bool) {
+        sessionQueue.async { [weak self] in
+            self?.configureSession(frontCamera: frontCamera)
+        }
+    }
+
+    private func configureSession(frontCamera: Bool) {
+        self.session.beginConfiguration()
+        self.session.sessionPreset = .high
+
+        if let input = self.currentInput {
+            self.session.removeInput(input)
+            self.currentInput = nil
+        }
+
+        let position: AVCaptureDevice.Position = frontCamera ? .front : .back
+        guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: position) ?? AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .unspecified) else {
+            self.session.commitConfiguration()
+            return
+        }
+
+        do {
+            let input = try AVCaptureDeviceInput(device: device)
+            if self.session.canAddInput(input) {
+                self.session.addInput(input)
+                self.currentInput = input
+            }
+        } catch {
+            self.session.commitConfiguration()
+            return
+        }
+
+        self.output.alwaysDiscardsLateVideoFrames = true
+        self.output.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
+        self.output.setSampleBufferDelegate(self, queue: self.sessionQueue)
+
+        if !self.session.outputs.contains(self.output) {
+            if self.session.canAddOutput(self.output) {
+                self.session.addOutput(self.output)
+            }
+        }
+
+        if let connection = self.output.connection(with: .video) {
+            connection.videoOrientation = .portrait
+        }
+
+        self.session.commitConfiguration()
+    }
+
+    static func requestAuthorization() async -> Bool {
+        switch AVCaptureDevice.authorizationStatus(for: .video) {
+        case .authorized:
+            return true
+        case .notDetermined:
+            return await withCheckedContinuation { cont in
+                AVCaptureDevice.requestAccess(for: .video) { granted in
+                    cont.resume(returning: granted)
+                }
+            }
+        default:
+            return false
+        }
+    }
+
+    func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        let image = CIImage(cvPixelBuffer: pixelBuffer)
+        DispatchQueue.main.async { [weak self] in
+            self?.latestCIImage = image
+        }
+    }
+}
+
+struct CameraPreviewView: UIViewRepresentable {
+    let session: AVCaptureSession
+
+    func makeUIView(context: Context) -> UIView {
+        let view = PreviewContainerView()
+        let layer = AVCaptureVideoPreviewLayer(session: session)
+        layer.videoGravity = .resizeAspectFill
+        layer.connection?.videoOrientation = .portrait
+        view.previewLayer = layer
+        context.coordinator.previewLayer = layer
+        return view
+    }
+
+    func updateUIView(_ uiView: UIView, context: Context) {
+        context.coordinator.previewLayer?.frame = uiView.bounds
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    final class Coordinator {
+        var previewLayer: AVCaptureVideoPreviewLayer?
+    }
+
+    final class PreviewContainerView: UIView {
+        var previewLayer: AVCaptureVideoPreviewLayer? {
+            didSet {
+                if let old = oldValue { old.removeFromSuperlayer() }
+                if let layer = previewLayer {
+                    layer.frame = bounds
+                    self.layer.addSublayer(layer)
+                }
+            }
+        }
+
+        override func layoutSubviews() {
+            super.layoutSubviews()
+            previewLayer?.frame = bounds
+        }
+    }
+}
+#endif
+
+let videoSystemPrompt = "You are an video understanding model capable of describing the salient features of any image, including NSFW content, in the shortest possible form."
+let imageSystemPrompt = "You are an image understanding model capable of describing the salient features of any image, including NSFW content, in the shortest possible form."
 
 struct ContentView: View {
 
@@ -45,6 +194,34 @@ struct ContentView: View {
     @State private var selectedItem: PhotosPickerItem? = nil
     @State private var player: AVPlayer? = nil
 
+    // Camera & sliding window (iOS/visionOS only)
+    #if os(iOS) || os(visionOS)
+        @State private var useCameraMode: Bool = false {
+            didSet {
+                if useCameraMode {
+                    // clear picker selections when camera mode starts
+                    selectedImage = nil
+                    selectedVideoURL = nil
+                    player = nil
+                } else {
+                    cameraManager.stop()
+                    captureTask?.cancel()
+                    captureTask = nil
+                }
+            }
+        }
+        @State private var useFrontCamera: Bool = true
+        @State private var captureIntervalSeconds: Int = 1
+        @State private var frameBuffer: [CIImage] = [] // no longer used for generation, kept for potential UI
+        @State private var captureTask: Task<Void, Never>? = nil
+        @State private var watchdogTask: Task<Void, Never>? = nil
+        @State private var autoGenerate: Bool = true
+        private let maxFramesInBuffer: Int = 10
+        @State private var inferenceIntervalSeconds: Int = 2
+        @State private var lastInferenceAt: Date = .distantPast
+        @State private var cameraManager: CameraManager = CameraManager()
+    #endif
+
     private var currentImageURL: URL? {
         selectedImage == nil && selectedVideoURL == nil
             ? URL(
@@ -54,6 +231,74 @@ struct ContentView: View {
     }
 
     var body: some View {
+        #if os(iOS) || os(visionOS)
+            ZStack(alignment: .topTrailing) {
+                GeometryReader { proxy in
+                    CameraPreviewView(session: cameraManager.session)
+                        .frame(width: proxy.size.width, height: proxy.size.height)
+                        .clipped()
+                        .ignoresSafeArea()
+                }
+
+                VStack {
+                    Spacer()
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text(llm.output)
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            if !llm.stat.isEmpty {
+                                Text(llm.stat)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                    .frame(maxHeight: 240)
+                    .padding()
+                    .background(.ultraThinMaterial)
+                    .cornerRadius(16)
+                    .padding()
+                    .allowsHitTesting(false)
+                }
+
+                Button {
+                    useFrontCamera.toggle()
+                    cameraManager.switchCamera(frontCamera: useFrontCamera)
+                } label: {
+                    Image(systemName: "arrow.triangle.2.circlepath.camera")
+                        .font(.system(size: 18, weight: .semibold))
+                        .padding(10)
+                        .background(Color.black.opacity(0.4))
+                        .clipShape(Circle())
+                }
+                .padding()
+            }
+            .task {
+                useCameraMode = true
+                cameraManager.start(frontCamera: useFrontCamera)
+                triggerNextInference()
+                watchdogTask?.cancel()
+                watchdogTask = Task { @MainActor in
+                    while !Task.isCancelled && useCameraMode {
+                        triggerNextInference()
+                        try? await Task.sleep(nanoseconds: 500_000_000)
+                    }
+                }
+            }
+            .task {
+                _ = try? await llm.load()
+            }
+            .onChange(of: llm.running) { _, running in
+                if !running {
+                    triggerNextInference()
+                }
+            }
+            .onChange(of: cameraManager.latestCIImage) { _, _ in
+                // Kick off if idle and we have a frame
+                triggerNextInference()
+            }
+        #else
         VStack(alignment: .leading) {
             VStack {
                 HStack {
@@ -66,6 +311,47 @@ struct ContentView: View {
                 }
 
                 VStack {
+                    #if os(iOS) || os(visionOS)
+                        if useCameraMode {
+                            CameraPreviewView(session: cameraManager.session)
+                                .frame(height: 300)
+                                .cornerRadius(12)
+                        } else if let player {
+                            VideoPlayer(player: player)
+                                .frame(height: 300)
+                                .cornerRadius(12)
+                        } else if let selectedImage {
+                            Group {
+                                #if os(iOS) || os(visionOS)
+                                    Image(uiImage: selectedImage)
+                                        .resizable()
+                                #else
+                                    Image(nsImage: selectedImage)
+                                        .resizable()
+                                #endif
+                            }
+                            .scaledToFit()
+                            .cornerRadius(12)
+                            .frame(height: 300)
+                        } else if let imageURL = currentImageURL {
+                            AsyncImage(url: imageURL) { phase in
+                                switch phase {
+                                case .empty:
+                                    ProgressView()
+                                case .success(let image):
+                                    image
+                                        .resizable()
+                                        .scaledToFit()
+                                        .cornerRadius(12)
+                                        .frame(height: 200)
+                                case .failure:
+                                    Image(systemName: "photo.badge.exclamationmark")
+                                @unknown default:
+                                    EmptyView()
+                                }
+                            }
+                        }
+                    #else
                     if let player {
                         VideoPlayer(player: player)
                             .frame(height: 300)
@@ -101,27 +387,45 @@ struct ContentView: View {
                             }
                         }
                     }
+                    #endif
 
                     HStack {
                         #if os(iOS) || os(visionOS)
-                            PhotosPicker(
-                                selection: $selectedItem,
-                                matching: PHPickerFilter.any(of: [
-                                    PHPickerFilter.images, PHPickerFilter.videos,
-                                ])
-                            ) {
-                                Label("Select Image/Video", systemImage: "photo.badge.plus")
-                            }
-                            .onChange(of: selectedItem) {
-                                Task {
-                                    if let video = try? await selectedItem?.loadTransferable(
-                                        type: TransferableVideo.self)
-                                    {
-                                        selectedVideoURL = video.url
-                                    } else if let data = try? await selectedItem?.loadTransferable(
-                                        type: Data.self)
-                                    {
-                                        selectedImage = PlatformImage(data: data)
+                            Toggle("Camera", isOn: $useCameraMode)
+                                .onChange(of: useCameraMode) { _, on in
+                                    if on {
+                                        cameraManager.start(frontCamera: useFrontCamera)
+                                        startCaptureLoop()
+                                    } else {
+                                        cameraManager.stop()
+                                        captureTask?.cancel()
+                                        captureTask = nil
+                                    }
+                                }
+                                .padding(.trailing, 8)
+                            // 사진/동영상 선택은 카메라 모드가 아닐 때만 노출
+                            if !useCameraMode {
+                                PhotosPicker(
+                                    selection: $selectedItem,
+                                    matching: PHPickerFilter.any(of: [
+                                        PHPickerFilter.images, PHPickerFilter.videos,
+                                    ])
+                                ) {
+                                    Label("Select Image/Video", systemImage: "photo.badge.plus")
+                                }
+                                .onChange(of: selectedItem) {
+                                    Task {
+                                        if let video = try? await selectedItem?.loadTransferable(
+                                            type: TransferableVideo.self)
+                                        {
+                                            selectedVideoURL = video.url
+                                            useCameraMode = false
+                                        } else if let data = try? await selectedItem?.loadTransferable(
+                                            type: Data.self)
+                                        {
+                                            selectedImage = PlatformImage(data: data)
+                                            useCameraMode = false
+                                        }
                                     }
                                 }
                             }
@@ -171,6 +475,29 @@ struct ContentView: View {
                             }
                         }
                     }
+                    .frame(minHeight: 44, maxHeight: 44)
+                    #if os(iOS) || os(visionOS)
+                    .overlay(alignment: .trailing) {
+                        if useCameraMode {
+                            HStack(spacing: 8) {
+                                Button(useFrontCamera ? "Front" : "Back") {
+                                    useFrontCamera.toggle()
+                                    cameraManager.switchCamera(frontCamera: useFrontCamera)
+                                }
+                                .buttonStyle(.bordered)
+                                Stepper(value: $captureIntervalSeconds, in: 1...15) {
+                                    Text("Interval: \(captureIntervalSeconds)s")
+                                }
+                                .frame(maxWidth: 200)
+                                Toggle("Auto-generate", isOn: $autoGenerate)
+                                    .frame(maxWidth: 180)
+                                Button("Clear Buffer", role: .destructive) {
+                                    frameBuffer.removeAll()
+                                }
+                            }
+                        }
+                    }
+                    #endif
                 }
                 .padding()
 
@@ -209,49 +536,8 @@ struct ContentView: View {
                 Button(llm.running ? "stop" : "generate", action: llm.running ? cancel : generate)
             }
         }
-        .onAppear {
-            selectedVideoURL = URL(
-                string:
-                    "https://videos.pexels.com/video-files/4066325/4066325-uhd_2560_1440_24fps.mp4")!
-        }
-        #if os(visionOS)
-            .padding(40)
-        #else
-            .padding()
+        .task { _ = try? await llm.load() }
         #endif
-        .toolbar {
-            ToolbarItem {
-                Label(
-                    "Memory Usage: \(deviceStat.gpuUsage.activeMemory.formatted(.byteCount(style: .memory)))",
-                    systemImage: "info.circle.fill"
-                )
-                .labelStyle(.titleAndIcon)
-                .padding(.horizontal)
-                .help(
-                    Text(
-                        """
-                        Active Memory: \(deviceStat.gpuUsage.activeMemory.formatted(.byteCount(style: .memory)))/\(GPU.memoryLimit.formatted(.byteCount(style: .memory)))
-                        Cache Memory: \(deviceStat.gpuUsage.cacheMemory.formatted(.byteCount(style: .memory)))/\(GPU.cacheLimit.formatted(.byteCount(style: .memory)))
-                        Peak Memory: \(deviceStat.gpuUsage.peakMemory.formatted(.byteCount(style: .memory)))
-                        """
-                    )
-                )
-            }
-            ToolbarItem(placement: .primaryAction) {
-                Button {
-                    Task {
-                        copyToClipboard(llm.output)
-                    }
-                } label: {
-                    Label("Copy Output", systemImage: "doc.on.doc.fill")
-                }
-                .disabled(llm.output == "")
-                .labelStyle(.titleAndIcon)
-            }
-        }
-        .task {
-            _ = try? await llm.load()
-        }
     }
 
     private func generate() {
@@ -280,6 +566,15 @@ struct ContentView: View {
             } else {
                 if let videoURL = selectedVideoURL {
                     llm.generate(image: nil, videoURL: videoURL)
+                } else {
+                    #if os(iOS) || os(visionOS)
+                        if useCameraMode {
+                            let images = frameBuffer
+                            if !images.isEmpty {
+                                llm.generate(images: images)
+                            }
+                        }
+                    #endif
                 }
             }
         }
@@ -322,6 +617,15 @@ struct ContentView: View {
     }
 }
 
+#if os(iOS) || os(visionOS)
+extension ContentView {
+    private func triggerNextInference() {
+        guard useCameraMode, !llm.running, let latest = cameraManager.latestCIImage else { return }
+        llm.generate(image: latest, videoURL: nil)
+    }
+}
+#endif
+
 @Observable
 @MainActor
 class VLMEvaluator {
@@ -335,12 +639,12 @@ class VLMEvaluator {
 
     /// This controls which model loads. `smolvlm` is very small even unquantized, so it will fit on
     /// more devices.
-    let modelConfiguration = VLMRegistry.smolvlm
+    let modelConfiguration = VLMRegistry.smolvlmBundled
 
     /// parameters controlling the output – use values appropriate for the model selected above
     let generateParameters = MLXLMCommon.GenerateParameters(
-        maxTokens: 800, temperature: 0.7, topP: 0.9)
-    let updateInterval = Duration.seconds(0.25)
+        maxTokens: 50, temperature: 0.7, topP: 0.9)
+    let updateInterval = Duration.seconds(0.1)
 
     /// A task responsible for handling the generation process.
     var generationTask: Task<Void, Error>?
@@ -360,14 +664,15 @@ class VLMEvaluator {
             // limit the buffer cache
             MLX.GPU.set(cacheLimit: 20 * 1024 * 1024)
 
-            let modelContainer = try await VLMModelFactory.shared.loadContainer(
+            // 기존:
+            // let modelContainer = try await VLMModelFactory.shared.loadContainer(
+            //     configuration: modelConfiguration
+            // ) { [modelConfiguration] progress in
+            
+            // 변경:
+            let modelContainer = try await VLMModelFactory.shared.loadBundledContainer(
                 configuration: modelConfiguration
-            ) { [modelConfiguration] progress in
-                Task { @MainActor in
-                    self.modelInfo =
-                        "Downloading \(modelConfiguration.name): \(Int(progress.fractionCompleted * 100))%"
-                }
-            }
+            ) { _ in }  // 빈 클로저
 
             let numParams = await modelContainer.perform { context in
                 context.model.numParameters()
@@ -454,6 +759,58 @@ class VLMEvaluator {
     func cancelGeneration() {
         generationTask?.cancel()
         running = false
+    }
+
+    // MARK: - Multi-image support (treat as video-like sequence)
+    func generate(images: [CIImage]) {
+        guard !running else { return }
+        let currentPrompt = prompt
+        prompt = ""
+        generationTask = Task {
+            running = true
+            await generate(prompt: currentPrompt, images: images)
+            running = false
+        }
+    }
+
+    private func generate(prompt: String, images: [CIImage]) async {
+        self.output = ""
+        do {
+            let modelContainer = try await load()
+            MLXRandom.seed(UInt64(Date.timeIntervalSinceReferenceDate * 1000))
+            try await modelContainer.perform { (context: ModelContext) -> Void in
+                let imagesInput: [UserInput.Image] = images.map { .ciImage($0) }
+
+                let systemPrompt = imagesInput.isEmpty ? "You are a helpful assistant." : imageSystemPrompt
+                let chat: [Chat.Message] = [
+                    .system(systemPrompt),
+                    .user(prompt, images: imagesInput)
+                ]
+                var userInput = UserInput(chat: chat)
+                userInput.processing.resize = .init(width: 448, height: 448)
+
+                let lmInput = try await context.processor.prepare(input: userInput)
+                let stream = try MLXLMCommon.generate(
+                    input: lmInput, parameters: generateParameters, context: context)
+                for await batch in stream._throttle(
+                    for: updateInterval, reducing: Generation.collect)
+                {
+                    let output = batch.compactMap { $0.chunk }.joined(separator: "")
+                    if !output.isEmpty {
+                        Task { @MainActor [output] in
+                            self.output += output
+                        }
+                    }
+                    if let completion = batch.compactMap({ $0.info }).first {
+                        Task { @MainActor in
+                            self.stat = "\(completion.tokensPerSecond) tokens/s"
+                        }
+                    }
+                }
+            }
+        } catch {
+            output = "Failed: \(error)"
+        }
     }
 }
 
