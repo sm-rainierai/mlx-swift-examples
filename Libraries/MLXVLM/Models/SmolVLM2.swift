@@ -14,8 +14,8 @@ import Tokenizers
 
 // MARK: - Configuration and modeling are Idefics3
 
-typealias SmolVLM2Configuration = Idefics3Configuration
-typealias SmolVLM2 = Idefics3
+public typealias SmolVLM2Configuration = Idefics3Configuration
+public typealias SmolVLM2 = Idefics3
 
 // MARK: - SmolVLMProcessor and configuration
 
