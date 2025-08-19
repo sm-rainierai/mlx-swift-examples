@@ -167,7 +167,7 @@ public class VLMRegistry: AbstractModelRegistry, @unchecked Sendable {
     )
 
     static public let smolvlm = ModelConfiguration(
-        id: "HuggingFaceTB/SmolVLM2-500M-Video-Instruct-mlx",
+        id: "EZCon/SmolVLM2-500M-Video-Instruct-4bit-mlx",
         defaultPrompt:
             "What is the main action or notable event happening in this segment? Describe it in one brief sentence."
     )
@@ -293,5 +293,146 @@ public class VLMModelFactory: ModelFactory {
 public class TrampolineModelFactory: NSObject, ModelFactoryTrampoline {
     public static func modelFactory() -> (any MLXLMCommon.ModelFactory)? {
         VLMModelFactory.shared
+    }
+}
+
+// MARK: - Bundled Model Support
+extension VLMRegistry {
+    // 번들된 모델을 위한 ModelConfiguration
+    static public let smolvlmBundled = ModelConfiguration(
+        id: "EZCon/SmolVLM2-500M-Video-Instruct-4bit-mlx",
+        defaultPrompt: "What is the main action or notable event happening in this segment? Describe it in one brief sentence."
+    )
+}
+
+// VLMModelFactory extension for bundled model loading
+extension VLMModelFactory {
+    
+    /// 번들된 모델을 로드하는 메서드
+    public func loadBundledContainer(
+        configuration: ModelConfiguration,
+        progressHandler: @Sendable @escaping (Progress) -> Void = { _ in }
+    ) async throws -> ModelContainer {
+        
+        // 번들에서 모델 찾기
+        let modelName = "SmolVLM2-500M-Video-Instruct-4bit-mlx"
+        
+        // 폴더가 folder reference로 추가된 경우
+        guard let modelURL = Bundle.main.url(forResource: modelName, withExtension: nil) else {
+            // 디버깅 정보
+            print("Model not found: \(modelName)")
+            if let resourcePath = Bundle.main.resourcePath {
+                do {
+                    let items = try FileManager.default.contentsOfDirectory(atPath: resourcePath)
+                    print("Bundle contains: \(items.prefix(10))...")  // 처음 10개만 출력
+                } catch {
+                    print("Error listing bundle: \(error)")
+                }
+            }
+            throw ModelFactoryError.unsupportedModelType("Bundled model not found: \(modelName)")
+        }
+        
+        let modelDirectory = modelURL
+        
+        // config.json 로드
+        let configurationURL = modelDirectory.appendingPathComponent("config.json")
+        guard FileManager.default.fileExists(atPath: configurationURL.path) else {
+            throw ModelFactoryError.unsupportedModelType("config.json not found in bundle")
+        }
+        
+        let baseConfig: BaseConfiguration
+        do {
+            baseConfig = try JSONDecoder().decode(
+                BaseConfiguration.self,
+                from: Data(contentsOf: configurationURL)
+            )
+        } catch let error as DecodingError {
+            throw ModelFactoryError.configurationDecodingError("config.json", configuration.name, error)
+        }
+        
+        // 모델 생성
+        let model: LanguageModel
+        do {
+            model = try typeRegistry.createModel(
+                configuration: configurationURL,
+                modelType: baseConfig.modelType
+            )
+        } catch let error as DecodingError {
+            throw ModelFactoryError.configurationDecodingError("config.json", configuration.name, error)
+        }
+        
+        // weights 로드
+        try loadWeights(
+            modelDirectory: modelDirectory,
+            model: model,
+            perLayerQuantization: baseConfig.perLayerQuantization
+        )
+        
+        // tokenizer 로드 - 번들에서 직접 로드
+        let tokenizer = try loadBundledTokenizer(from: modelDirectory)
+        
+        // processor 로드
+        let processorConfigurationURL = modelDirectory.appendingPathComponent("preprocessor_config.json")
+        guard FileManager.default.fileExists(atPath: processorConfigurationURL.path) else {
+            throw ModelFactoryError.unsupportedProcessorType("preprocessor_config.json not found in bundle")
+        }
+        
+        let baseProcessorConfig: BaseProcessorConfiguration
+        do {
+            baseProcessorConfig = try JSONDecoder().decode(
+                BaseProcessorConfiguration.self,
+                from: Data(contentsOf: processorConfigurationURL)
+            )
+        } catch let error as DecodingError {
+            throw ModelFactoryError.configurationDecodingError("preprocessor_config.json", configuration.name, error)
+        }
+        
+        let processor = try processorRegistry.createModel(
+            configuration: processorConfigurationURL,
+            processorType: baseProcessorConfig.processorClass,
+            tokenizer: tokenizer
+        )
+        
+        // Progress 완료 표시
+        let progress = Progress(totalUnitCount: 1)
+        progress.completedUnitCount = 1
+        progressHandler(progress)
+        
+        let context = ModelContext(
+            configuration: configuration,
+            model: model,
+            processor: processor,
+            tokenizer: tokenizer
+        )
+        
+        return ModelContainer(context: context)
+    }
+    
+    /// 번들에서 토크나이저 로드
+    private func loadBundledTokenizer(from modelDirectory: URL) throws -> any Tokenizer {
+        let tokenizerConfigURL = modelDirectory.appendingPathComponent("tokenizer_config.json")
+        let tokenizerDataURL = modelDirectory.appendingPathComponent("tokenizer.json")
+        
+        // tokenizer_config.json 로드
+        guard FileManager.default.fileExists(atPath: tokenizerConfigURL.path) else {
+            throw ModelFactoryError.unsupportedModelType("tokenizer_config.json not found in bundle")
+        }
+        
+        let tokenizerConfigData = try Data(contentsOf: tokenizerConfigURL)
+        let tokenizerConfig = try JSONDecoder().decode(Config.self, from: tokenizerConfigData)
+        
+        // tokenizer.json 로드
+        guard FileManager.default.fileExists(atPath: tokenizerDataURL.path) else {
+            throw ModelFactoryError.unsupportedModelType("tokenizer.json not found in bundle")
+        }
+        
+        let tokenizerDataData = try Data(contentsOf: tokenizerDataURL)
+        let tokenizerData = try JSONDecoder().decode(Config.self, from: tokenizerDataData)
+        
+        // AutoTokenizer를 사용하여 적절한 토크나이저 생성
+        return try AutoTokenizer.from(
+            tokenizerConfig: tokenizerConfig,
+            tokenizerData: tokenizerData
+        )
     }
 }
