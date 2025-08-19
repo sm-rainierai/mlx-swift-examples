@@ -32,7 +32,7 @@ import Tokenizers
 /// }
 /// ```
 public actor ModelContainer {
-    var context: ModelContext
+    public var context: ModelContext
     public var configuration: ModelConfiguration { context.configuration }
 
     public init(context: ModelContext) {
