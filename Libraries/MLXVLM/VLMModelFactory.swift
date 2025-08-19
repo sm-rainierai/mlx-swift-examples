@@ -296,6 +296,15 @@ public class TrampolineModelFactory: NSObject, ModelFactoryTrampoline {
     }
 }
 
+// MARK: - Bundled Model Support
+extension VLMRegistry {
+    // 번들된 모델을 위한 ModelConfiguration
+    static public let smolvlmBundled = ModelConfiguration(
+        id: "EZCon/SmolVLM2-500M-Video-Instruct-4bit-mlx",
+        defaultPrompt: "What is the main action or notable event happening in this segment? Describe it in one brief sentence."
+    )
+}
+
 // VLMModelFactory extension for bundled model loading (수정된 버전)
 extension VLMModelFactory {
     
