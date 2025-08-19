@@ -230,54 +230,107 @@ public class SmolVLMProcessor: UserInputProcessor {
             let mask = ones(like: tokensArray)
             return LMInput(text: .init(tokens: tokensArray, mask: mask), image: nil)
         } else if input.images.count > 0 && input.videos.isEmpty {
-            // Single image scenario
-            guard input.images.count == 1 else {
-                throw VLMError.singleImageAllowed
-            }
+            // Image scenario: support both single image and multiple images.
+            // - If a single image: follow original tiling path.
+            // - If multiple images: treat as a video-like sequence of frames.
 
             // Unfortunately we don't have a "render" option in Tokenizers yet, so decoding
             let promptTokens = try tokenizer.applyChatTemplate(messages: messages)
             let decoded = try tokenizer.decode(tokens: promptTokens, skipSpecialTokens: false)
 
-            let image = try input.images[0].asCIImage().toSRGB()
-            let (tiles, imageRows, imageCols) = tiles(from: image)
+            if input.images.count == 1 {
+                let image = try input.images[0].asCIImage().toSRGB()
+                let (tiles, imageRows, imageCols) = tiles(from: image)
 
-            // Append the resized global image
-            // Note we are resampling from the original (potentially larger), not the processing size. It shouldn't make much difference.
-            let images =
-                tiles + [
-                    image.resampled(
-                        to: CGSize(width: fixedImageSize, height: fixedImageSize), method: .lanczos)
-                ]
+                // Append the resized global image
+                // Note we are resampling from the original (potentially larger), not the processing size. It shouldn't make much difference.
+                let images =
+                    tiles + [
+                        image.resampled(
+                            to: CGSize(width: fixedImageSize, height: fixedImageSize), method: .lanczos)
+                    ]
 
-            let pixelsForImages = images.map {
-                $0.normalized(mean: config.imageMeanTuple, std: config.imageStdTuple).asMLXArray()
+                let pixelsForImages = images.map {
+                    $0.normalized(mean: config.imageMeanTuple, std: config.imageStdTuple).asMLXArray()
+                }
+
+                // In transformers we have a batch dim plus the number of images per batch, and they get collapsed inside the model.
+                // Here we provide the compact version.
+                let pixels = concatenated(pixelsForImages, axis: 0).transposed(0, 2, 3, 1)
+
+                let imagePromptString = getImagePromptString(
+                    rows: imageRows,
+                    cols: imageCols,
+                    seqLen: imageSequenceLength,
+                    fakeToken: fakeImageToken,
+                    imageToken: imageToken,
+                    globalImageToken: globalImageToken
+                )
+
+                let splitPrompt = decoded.split(by: imageToken, options: .literal)
+                let prompt = splitPrompt.joined(separator: imagePromptString)
+                let finalPromptTokens = try tokenizer.encode(text: prompt)
+
+                let promptArray = MLXArray(finalPromptTokens).expandedDimensions(axis: 0)
+                let mask = ones(like: promptArray)
+
+                return LMInput(
+                    text: .init(tokens: promptArray, mask: mask),
+                    image: .init(pixels: pixels)
+                )
+            } else {
+                // Multiple images -> treat as a sequence of frames (video-like)
+                // Process each image into a frame of size fixedImageSize and normalize
+                let processedFrames: [MLXArray] = try input.images.map { img in
+                    try img.asCIImage()
+                        .toSRGB()
+                        .resampled(
+                            to: CGSize(width: fixedImageSize, height: fixedImageSize), method: .lanczos
+                        )
+                        .normalized(mean: config.imageMeanTuple, std: config.imageStdTuple)
+                        .asMLXArray()
+                }
+
+                let thwFrames = (0 ..< processedFrames.count).map {
+                    THW($0, Int(fixedImageSize), Int(fixedImageSize))
+                }
+
+                let stackedFrames = concatenated(processedFrames, axis: 0)
+                let transposedFrames = stackedFrames.transposed(0, 2, 3, 1)
+
+                // Build a video-like prompt with frame markers.
+                // For lack of real timestamps, synthesize 5s intervals (0, 5, 10, ...).
+                func formatHMS(_ totalSeconds: Int) -> String {
+                    let hours = totalSeconds / 3600
+                    let minutes = (totalSeconds % 3600) / 60
+                    let seconds = totalSeconds % 60
+                    return String(format: "%d:%02d:%02d", hours, minutes, seconds)
+                }
+                let timeStamps = (0 ..< processedFrames.count).map { index in
+                    formatHMS(index * 5)
+                }
+                let durationSeconds = max((processedFrames.count - 1) * 5, 0)
+                let videoPromptString = getVideoPromptString(
+                    frameCount: processedFrames.count,
+                    timeStamps: timeStamps,
+                    videoDuration: formatHMS(durationSeconds),
+                    seqLen: imageSequenceLength,
+                    fakeToken: fakeImageToken,
+                    imageToken: imageToken,
+                    globalImageToken: globalImageToken
+                )
+
+                let splitPrompt = decoded.split(by: "User: ", options: .literal)
+                let prompt = splitPrompt[0] + "User: " + videoPromptString + splitPrompt[1]
+                let finalPromptTokens = try tokenizer.encode(text: prompt)
+
+                let promptArray = MLXArray(finalPromptTokens).expandedDimensions(axis: 0)
+                let mask = ones(like: promptArray)
+                return LMInput(
+                    text: .init(tokens: promptArray, mask: mask),
+                    image: .init(pixels: transposedFrames, frames: thwFrames)
+                )
             }
-
-            // In transformers we have a batch dim plus the number of images per batch, and they get collapsed inside the model.
-            // Here we provide the compact version.
-            let pixels = concatenated(pixelsForImages, axis: 0).transposed(0, 2, 3, 1)
-
-            let imagePromptString = getImagePromptString(
-                rows: imageRows,
-                cols: imageCols,
-                seqLen: imageSequenceLength,
-                fakeToken: fakeImageToken,
-                imageToken: imageToken,
-                globalImageToken: globalImageToken
-            )
-
-            let splitPrompt = decoded.split(by: imageToken, options: .literal)
-            let prompt = splitPrompt.joined(separator: imagePromptString)
-            let finalPromptTokens = try tokenizer.encode(text: prompt)
-
-            let promptArray = MLXArray(finalPromptTokens).expandedDimensions(axis: 0)
-            let mask = ones(like: promptArray)
-
-            return LMInput(
-                text: .init(tokens: promptArray, mask: mask),
-                image: .init(pixels: pixels)
-            )
         } else {
             // Single video scenario
             guard input.images.count == 0 else {
