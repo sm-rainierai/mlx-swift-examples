@@ -296,80 +296,98 @@ public class TrampolineModelFactory: NSObject, ModelFactoryTrampoline {
     }
 }
 
-// MARK: - Bundled Model Support
-extension VLMRegistry {
-    // 번들된 모델을 위한 ModelConfiguration
-    static public let smolvlmBundled = ModelConfiguration(
-        id: "EZCon/SmolVLM2-500M-Video-Instruct-4bit-mlx",
-        defaultPrompt: "What is the main action or notable event happening in this segment? Describe it in one brief sentence."
-    )
-}
-
-// VLMModelFactory extension for bundled model loading
+// VLMModelFactory extension for bundled model loading (수정된 버전)
 extension VLMModelFactory {
     
-    /// 번들된 모델을 로드하는 메서드
+    /// 번들된 모델을 로드하는 메서드 (개별 파일들이 번들 루트에 있는 경우)
     public func loadBundledContainer(
         configuration: ModelConfiguration,
         progressHandler: @Sendable @escaping (Progress) -> Void = { _ in }
     ) async throws -> ModelContainer {
         
-        // 번들에서 모델 찾기
-        let modelName = "SmolVLM2-500M-Video-Instruct-4bit-mlx"
+        print("=== 번들 모델 로딩 시작 ===")
         
-        // 폴더가 folder reference로 추가된 경우
-        guard let modelURL = Bundle.main.url(forResource: modelName, withExtension: nil) else {
-            // 디버깅 정보
-            print("Model not found: \(modelName)")
-            if let resourcePath = Bundle.main.resourcePath {
-                do {
-                    let items = try FileManager.default.contentsOfDirectory(atPath: resourcePath)
-                    print("Bundle contains: \(items.prefix(10))...")  // 처음 10개만 출력
-                } catch {
-                    print("Error listing bundle: \(error)")
-                }
-            }
-            throw ModelFactoryError.unsupportedModelType("Bundled model not found: \(modelName)")
+        // 번들 루트를 모델 디렉토리로 사용
+        guard let bundleURL = Bundle.main.resourceURL else {
+            throw ModelFactoryError.unsupportedModelType("Bundle resource URL not found")
         }
         
-        let modelDirectory = modelURL
+        let modelDirectory = bundleURL
+        print("모델 디렉토리: \(modelDirectory.path)")
+        
+        // 필수 파일들 존재 확인
+        let requiredFiles = [
+            "config.json",
+            "preprocessor_config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "model.safetensors"
+        ]
+        
+        print("=== 필수 파일 확인 ===")
+        for fileName in requiredFiles {
+            let fileURL = modelDirectory.appendingPathComponent(fileName)
+            let exists = FileManager.default.fileExists(atPath: fileURL.path)
+            print("\(exists ? "✅" : "❌") \(fileName)")
+            
+            if !exists {
+                throw ModelFactoryError.unsupportedModelType("\(fileName) not found in bundle")
+            }
+        }
         
         // config.json 로드
         let configurationURL = modelDirectory.appendingPathComponent("config.json")
-        guard FileManager.default.fileExists(atPath: configurationURL.path) else {
-            throw ModelFactoryError.unsupportedModelType("config.json not found in bundle")
-        }
-        
         let baseConfig: BaseConfiguration
         do {
+            print("config.json 로딩...")
             baseConfig = try JSONDecoder().decode(
                 BaseConfiguration.self,
                 from: Data(contentsOf: configurationURL)
             )
+            print("✅ config.json 로딩 완료 - 모델 타입: \(baseConfig.modelType)")
         } catch let error as DecodingError {
+            print("❌ config.json 디코딩 실패: \(error)")
             throw ModelFactoryError.configurationDecodingError("config.json", configuration.name, error)
         }
         
         // 모델 생성
         let model: LanguageModel
         do {
+            print("모델 인스턴스 생성...")
             model = try typeRegistry.createModel(
                 configuration: configurationURL,
                 modelType: baseConfig.modelType
             )
+            print("✅ 모델 인스턴스 생성 완료")
         } catch let error as DecodingError {
+            print("❌ 모델 생성 실패: \(error)")
             throw ModelFactoryError.configurationDecodingError("config.json", configuration.name, error)
         }
         
         // weights 로드
-        try loadWeights(
-            modelDirectory: modelDirectory,
-            model: model,
-            perLayerQuantization: baseConfig.perLayerQuantization
-        )
+        do {
+            print("모델 가중치 로딩...")
+            try loadWeights(
+                modelDirectory: modelDirectory,
+                model: model,
+                perLayerQuantization: baseConfig.perLayerQuantization
+            )
+            print("✅ 모델 가중치 로딩 완료")
+        } catch {
+            print("❌ 가중치 로딩 실패: \(error)")
+            throw error
+        }
         
-        // tokenizer 로드 - 번들에서 직접 로드
-        let tokenizer = try loadBundledTokenizer(from: modelDirectory)
+        // tokenizer 로드
+        let tokenizer: any Tokenizer
+        do {
+            print("토크나이저 로딩...")
+            tokenizer = try loadBundledTokenizer(from: modelDirectory)
+            print("✅ 토크나이저 로딩 완료")
+        } catch {
+            print("❌ 토크나이저 로딩 실패: \(error)")
+            throw error
+        }
         
         // processor 로드
         let processorConfigurationURL = modelDirectory.appendingPathComponent("preprocessor_config.json")
@@ -379,19 +397,30 @@ extension VLMModelFactory {
         
         let baseProcessorConfig: BaseProcessorConfiguration
         do {
+            print("프로세서 설정 로딩...")
             baseProcessorConfig = try JSONDecoder().decode(
                 BaseProcessorConfiguration.self,
                 from: Data(contentsOf: processorConfigurationURL)
             )
+            print("✅ 프로세서 설정 로딩 완료 - 타입: \(baseProcessorConfig.processorClass)")
         } catch let error as DecodingError {
+            print("❌ 프로세서 설정 디코딩 실패: \(error)")
             throw ModelFactoryError.configurationDecodingError("preprocessor_config.json", configuration.name, error)
         }
         
-        let processor = try processorRegistry.createModel(
-            configuration: processorConfigurationURL,
-            processorType: baseProcessorConfig.processorClass,
-            tokenizer: tokenizer
-        )
+        let processor: any UserInputProcessor
+        do {
+            print("프로세서 인스턴스 생성...")
+            processor = try processorRegistry.createModel(
+                configuration: processorConfigurationURL,
+                processorType: baseProcessorConfig.processorClass,
+                tokenizer: tokenizer
+            )
+            print("✅ 프로세서 인스턴스 생성 완료")
+        } catch {
+            print("❌ 프로세서 생성 실패: \(error)")
+            throw error
+        }
         
         // Progress 완료 표시
         let progress = Progress(totalUnitCount: 1)
@@ -405,6 +434,7 @@ extension VLMModelFactory {
             tokenizer: tokenizer
         )
         
+        print("✅ 모델 컨테이너 생성 완료")
         return ModelContainer(context: context)
     }
     
